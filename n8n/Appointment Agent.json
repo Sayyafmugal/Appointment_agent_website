@@ -1,0 +1,1134 @@
+{
+  "name": "Appointment Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1280,
+        176
+      ],
+      "id": "693a8528-995c-455c-9333-da98080a3a98",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "=YOUR_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Appointments",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -1072,
+        176
+      ],
+      "id": "39f900f9-eb1c-4683-a1cb-64fe0f887a53",
+      "name": "Get row(s) in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "lFe66XzWiOEJtkGu",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// =============================================================\n//  BUILD REMINDER QUEUE\n//  Required Node Setting: \"Run Once for All Items\"\n// =============================================================\n\n// ---------- 0. Configuration ---------------------------------\nconst CLINIC_NAME  = 'Your Clinic Agent';\nconst CLINIC_PHONE = '+92 42 111 222 333';\nconst CLINIC_TZ    = 'Asia/Karachi';\nconst LEAD_DAYS    = 1;\nconst TEST_MODE    = false; // Set to TRUE for testing (bypasses date matching)\n\n// ---------- 1. Target Date Calculation ----------------------\nlet targetDate = '';\nlet runDate = '';\n\ntry {\n  const now = DateTime.now().setZone(CLINIC_TZ);\n  targetDate = now.plus({ days: LEAD_DAYS }).toFormat('yyyy-MM-dd');\n  runDate    = now.toFormat('yyyy-MM-dd');\n} catch (e) {\n  const d = new Date();\n  d.setDate(d.getDate() + LEAD_DAYS);\n  targetDate = d.toISOString().split('T')[0];\n  runDate    = new Date().toISOString().split('T')[0];\n}\n\n// ---------- 2. Helper Functions -----------------------------\nconst clean  = (v) => String(v ?? '').trim();\nconst isTrue = (v) => {\n  const s = clean(v).toUpperCase();\n  return s === 'TRUE' || s === '1' || v === true;\n};\nconst E164  = /^\\+[1-9]\\d{7,14}$/;\nconst EMAIL = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/;\nconst esc   = (v) => clean(v)\n  .replace(/&/g, '&amp;')\n  .replace(/</g, '&lt;')\n  .replace(/>/g, '&gt;');\n\n// ---------- 2b. WEBSITE INTEGRATION (ADDITIVE) ----------------\n// This block, and every other change marked ADDITIVE in this file, was\n// added so the same processing pipeline can also be triggered on-demand\n// from the \"Appointment Agent\" web dashboard's \"Webhook Trigger\" node,\n// instead of only the daily 9am \"Schedule Trigger\". It is wrapped in\n// try/catch so a Schedule-Trigger run (where \"Webhook Trigger\" never\n// executed) falls through unchanged and behaves exactly as the original\n// workflow always did.\n//\n// Website request body shapes:\n//   { \"mode\": \"run\" }                                  -> normal tomorrow batch\n//   { \"mode\": \"single\",  \"appointment_id\": \"A-1001\" }   -> force-send one appointment\n//   { \"mode\": \"preview\", \"appointment_id\": \"A-1001\" }   -> render only, never sends\nlet mode = 'run';\nlet targetAppointmentId = null;\nlet triggeredByWebhook = false;\ntry {\n  const wh = $('Webhook Trigger').first();\n  if (wh) {\n    triggeredByWebhook = true;\n    const body = (wh.json && wh.json.body) || {};\n    if (body.mode === 'single' || body.mode === 'preview') {\n      mode = body.mode;\n      targetAppointmentId = clean(body.appointment_id) || null;\n    }\n  }\n} catch (e) {\n  // \"Webhook Trigger\" did not run this execution -> this is a Schedule-Trigger run.\n}\nconst isTargeted = (mode === 'single' || mode === 'preview') && !!targetAppointmentId;\n\n// ---------- 3. Process Items ---------------------------------\nconst queue = [];\nconst items = $input.all();\nlet matchedTargeted = false;\n\nfor (let i = 0; i < items.length; i++) {\n  const r = items[i].json;\n\n  if (isTargeted) {\n    // ADDITIVE: website-triggered single send/preview -> match one\n    // appointment_id regardless of its date, instead of the tomorrow filter.\n    if (clean(r.appointment_id) !== targetAppointmentId) continue;\n    matchedTargeted = true;\n  } else {\n    // 3a. Date filter (disabled when TEST_MODE = true)\n    if (!TEST_MODE && clean(r.appointment_date) !== targetDate) {\n      continue;\n    }\n  }\n\n  const notScheduled = clean(r.status).toLowerCase() !== 'scheduled';\n  const alreadySent  = clean(r.reminder_sent).toUpperCase() === 'YES';\n\n  if (!isTargeted) {\n    // 3b. Status filter\n    if (notScheduled) continue;\n    // 3c. Idempotency guard\n    if (alreadySent) continue;\n  }\n\n  // 3d. Consent & Contact validation\n  const phoneOk = E164.test(clean(r.phone_e164)) && isTrue(r.consent_sms);\n  const emailOk = EMAIL.test(clean(r.email)) && isTrue(r.consent_email);\n\n  let channel = null;\n  let skip_reason = null;\n  const preferred = clean(r.preferred_channel).toLowerCase();\n\n  if (isTargeted && notScheduled) {\n    // ADDITIVE: a forced send/preview on a non-Scheduled appointment is\n    // reported back as a skip, never silently sent or previewed.\n    skip_reason = 'not_scheduled';\n  } else if (isTargeted && alreadySent) {\n    // ADDITIVE: never bypass the idempotency guard just because an admin\n    // clicked \"Send\" - report it back instead.\n    skip_reason = 'already_reminded';\n  } else if (preferred === 'sms' && phoneOk) {\n    channel = 'sms';\n  } else if (preferred === 'email' && emailOk) {\n    channel = 'email';\n  } else if (phoneOk) {\n    channel = 'sms';\n  } else if (emailOk) {\n    channel = 'email';\n  } else {\n    skip_reason = (!isTrue(r.consent_sms) && !isTrue(r.consent_email))\n      ? 'no_consent_on_file'\n      : 'invalid_contact_details';\n  }\n\n  // 3e. Formatted Date & Time Parsing\n  let readable_date = clean(r.appointment_date);\n  let readable_time = clean(r.appointment_time);\n\n  try {\n    const when = DateTime.fromFormat(\n      clean(r.appointment_date) + ' ' + clean(r.appointment_time),\n      'yyyy-MM-dd HH:mm',\n      { zone: CLINIC_TZ }\n    );\n    if (when.isValid) {\n      readable_date = when.toFormat('cccc d LLLL');\n      readable_time = when.toFormat('h:mm a');\n    }\n  } catch (e) {\n    // Keep raw values if Luxon parsing fails\n  }\n\n  const first_name = clean(r.patient_first_name) || 'there';\n  const clinician  = clean(r.clinician);\n  const location   = clean(r.location);\n  const apptId     = clean(r.appointment_id);\n\n  // 3f. Pre-render SMS\n  const sms_text =\n    `${CLINIC_NAME}: Hi ${first_name}, reminder of your appointment on ` +\n    `${readable_date} at ${readable_time} with ${clinician} ` +\n    `(${location}). Ref ${apptId}. Reply C to cancel or call ${CLINIC_PHONE}.`;\n\n  // 3g. Pre-render HTML Email\n  const email_subject = `Appointment reminder - ${readable_date} at ${readable_time}`;\n  const email_html =\n    '<div style=\"font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#1f2933;line-height:1.6;\">' +\n      '<h2 style=\"margin:0 0 4px;color:#0b6b5b;\">Appointment Reminder</h2>' +\n      '<p style=\"margin:0 0 20px;color:#6b7280;font-size:13px;\">' + esc(CLINIC_NAME) + '</p>' +\n      '<p>Hi ' + esc(first_name) + ',</p>' +\n      '<p>This is a reminder of your upcoming appointment.</p>' +\n      '<table style=\"width:100%;border-collapse:collapse;font-size:14px;margin:18px 0;\">' +\n        '<tr><td style=\"padding:8px;border:1px solid #dde3ec;width:34%;background:#f6faf9;font-weight:bold;\">Date</td>' +\n        '<td style=\"padding:8px;border:1px solid #dde3ec;\">' + esc(readable_date) + '</td></tr>' +\n        '<tr><td style=\"padding:8px;border:1px solid #dde3ec;background:#f6faf9;font-weight:bold;\">Time</td>' +\n        '<td style=\"padding:8px;border:1px solid #dde3ec;\">' + esc(readable_time) + '</td></tr>' +\n        '<tr><td style=\"padding:8px;border:1px solid #dde3ec;background:#f6faf9;font-weight:bold;\">Clinician</td>' +\n        '<td style=\"padding:8px;border:1px solid #dde3ec;\">' + esc(clinician) + '</td></tr>' +\n        '<tr><td style=\"padding:8px;border:1px solid #dde3ec;background:#f6faf9;font-weight:bold;\">Location</td>' +\n        '<td style=\"padding:8px;border:1px solid #dde3ec;\">' + esc(location) + '</td></tr>' +\n        '<tr><td style=\"padding:8px;border:1px solid #dde3ec;background:#f6faf9;font-weight:bold;\">Reference</td>' +\n        '<td style=\"padding:8px;border:1px solid #dde3ec;\">' + esc(apptId) + '</td></tr>' +\n      '</table>' +\n      '<p>Please arrive 10 minutes early. To cancel or reschedule, call <strong>' + esc(CLINIC_PHONE) + '</strong> at least 24 hours beforehand so we can offer the slot to another patient.</p>' +\n      '<p style=\"margin-top:22px;\">Kind regards,<br><strong>' + esc(CLINIC_NAME) + '</strong></p>' +\n      '<hr style=\"border:none;border-top:1px solid #e3e8ef;margin:24px 0 10px;\">' +\n      '<p style=\"font-size:11px;color:#9aa5b1;margin:0;\">Automated reminder. Please do not reply with medical information; this mailbox is not monitored by clinical staff.</p>' +\n    '</div>';\n\n  queue.push({\n    json: {\n      row_number:        r.row_number,\n      appointment_id:    apptId,\n      first_name,\n      phone_e164:        clean(r.phone_e164),\n      email:             clean(r.email),\n      clinician,\n      location,\n      appointment_date: clean(r.appointment_date),\n      readable_date,\n      readable_time,\n      channel,\n      has_valid_contact: channel !== null,\n      skip_reason,\n      sms_text,\n      email_subject,\n      email_html,\n      target_date:      targetDate,\n      run_date:         runDate,\n      mode // ADDITIVE: read by \"Is Preview?\" / \"Log Run Summary\" downstream\n    }\n  });\n\n  if (isTargeted) break; // single/preview mode only ever needs one item\n}\n\n// ADDITIVE: if a website-triggered single send/preview named an\n// appointment_id that matched nothing eligible above, guarantee one output\n// item anyway so the webhook caller gets a real response instead of hanging.\nif (isTargeted && !matchedTargeted) {\n  queue.push({\n    json: {\n      row_number: null,\n      appointment_id: targetAppointmentId,\n      first_name: '',\n      phone_e164: '',\n      email: '',\n      clinician: '',\n      location: '',\n      appointment_date: '',\n      readable_date: '',\n      readable_time: '',\n      channel: null,\n      has_valid_contact: false,\n      skip_reason: 'not_found',\n      sms_text: '',\n      email_subject: '',\n      email_html: '',\n      target_date: targetDate,\n      run_date: runDate,\n      mode\n    }\n  });\n}\n\n// ADDITIVE: if this was a website-triggered batch run (\"Run Reminder\n// Agent\") and nothing was due, the queue is legitimately empty - but an\n// empty array here means NO downstream node fires at all (n8n does not run\n// nodes on 0 input items), so the webhook caller would get no response.\n// This marker item is caught by \"Is Empty Webhook Run?\" immediately after\n// this node and routed straight to a zero-value response, WITHOUT flowing\n// through \"Has Valid Contact?\" / \"Log Skipped Records\" / \"Mark Reminder\n// Sent\", so it can never create a bogus Exceptions row or send anything.\n// A Schedule-Trigger run with nothing due is untouched: queue stays\n// genuinely empty and the workflow ends quietly, exactly as before.\nif (!isTargeted && triggeredByWebhook && queue.length === 0) {\n  queue.push({\n    json: { __empty_run: true, run_date: runDate, target_date: targetDate, mode }\n  });\n}\n\n// An empty array is still a valid, healthy result for a Schedule-Trigger\n// run: it simply means no appointments are scheduled for the target date.\nreturn queue;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        176
+      ],
+      "id": "27856db9-e98a-45ac-b693-804863a047c7",
+      "name": "Build Reminder Queue"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "bf61b7c5-1a82-4d43-a27b-1aa2c0d1251f",
+              "leftValue": "={{ $json.has_valid_contact }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -240,
+        176
+      ],
+      "id": "341c2990-62f4-4aa3-b42b-b54650954a7b",
+      "name": "Has Valid Contact?"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "sms",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "794eacf0-4628-4ab8-a16f-9bcf699843e8"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sms"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a69cde6c-ab59-489f-ba69-a494ba2f35a7",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "email",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "email"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -32,
+        80
+      ],
+      "id": "6ac39f07-a7fe-4d81-8cc3-78d3d9f9f85c",
+      "name": "Route by Channel"
+    },
+    {
+      "parameters": {
+        "from": "+923244644527",
+        "to": "={{ $json.phone_e164 }}",
+        "message": "={{ $json.sms_text }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.sms77",
+      "typeVersion": 1,
+      "position": [
+        176,
+        -16
+      ],
+      "id": "1ee386ad-edcb-41e2-a566-b6bb7dd5fbeb",
+      "name": "Send SMS Reminder",
+      "credentials": {
+        "sms77Api": {
+          "id": "f6qaxWohh785qcDa",
+          "name": "seven account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.email }}",
+        "subject": "={{ $json.email_subject }}",
+        "message": "={{ $json.email_html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        176,
+        176
+      ],
+      "id": "36e3a30b-6039-4905-9e96-661605b4e0cc",
+      "name": "Send Email Reminder",
+      "webhookId": "75e36dd1-21ba-478c-8020-f84182a17642",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "W4jCspOVlzz2XkBW",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SPREADSHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Appointments",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $('Build Reminder Queue').item.json.row_number }}",
+            "reminder_sent": "YES",
+            "reminder_channel": "={{ $('Build Reminder Queue').item.json.channel }}",
+            "reminder_sent_at": "={{ $now.setZone('Asia/Karachi').toFormat('yyyy-MM-dd HH:mm') }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "appointment_id",
+              "displayName": "appointment_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "patient_first_name",
+              "displayName": "patient_first_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "patient_last_name",
+              "displayName": "patient_last_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "phone_e164",
+              "displayName": "phone_e164",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "appointment_date",
+              "displayName": "appointment_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "appointment_time",
+              "displayName": "appointment_time",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "clinician",
+              "displayName": "clinician",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "location",
+              "displayName": "location",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "preferred_channel",
+              "displayName": "preferred_channel",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "consent_sms",
+              "displayName": "consent_sms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "consent_email",
+              "displayName": "consent_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "reminder_sent",
+              "displayName": "reminder_sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "reminder_channel",
+              "displayName": "reminder_channel",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "reminder_sent_at",
+              "displayName": "reminder_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        640,
+        64
+      ],
+      "id": "ef44513f-479b-495c-932a-e1747fe83e7b",
+      "name": "Mark Reminder Sent",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "lFe66XzWiOEJtkGu",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Exceptions",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_date": "={{ $json.run_date }}",
+            "appointment_id": "={{ $json.appointment_id }}",
+            "appointment_date": "={{ $json.appointment_date }}",
+            "reason": "={{ $json.skip_reason }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "run_date",
+              "displayName": "run_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "appointment_id",
+              "displayName": "appointment_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "appointment_date",
+              "displayName": "appointment_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "reason",
+              "displayName": "reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        80,
+        368
+      ],
+      "id": "72bf19b3-d436-4ffd-89cb-3df469d1e7ec",
+      "name": "Log Skipped Records",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "lFe66XzWiOEJtkGu",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Items arriving here are the rows we successfully updated.\nconst sentCount = $input.all().length;\n// Reach back to the queue for the full picture, including skips.\nconst queue   = $('Build Reminder Queue').all().map(i => i.json);\nconst total   = queue.length;\nconst skipped = queue.filter(q => !q.has_valid_contact);\nconst bySms   = queue.filter(q => q.channel === 'sms').length;\nconst byEmail = queue.filter(q => q.channel === 'email').length;\n// Group the skip reasons so the front desk knows what to fix.\nconst reasons = {};\nfor (const s of skipped) {\n  reasons[s.skip_reason] = (reasons[s.skip_reason] || 0) + 1;\n}\nconst reasonText = Object.entries(reasons)\n  .map(([k, v]) => k.replace(/_/g, ' ') + ': ' + v)\n  .join(', ') || 'none';\nconst runDate    = queue[0]?.run_date    ?? DateTime.now().toFormat('yyyy-MM-dd');\nconst targetDate = queue[0]?.target_date ?? 'n/a';\nconst summary =\n  '*Appointment Reminder Run - ' + runDate + '*\\n' +\n  'Appointments on ' + targetDate + ': *' + total + '*\\n' +\n  'Reminders sent: *' + sentCount + '*  (SMS ' + bySms +\n  ', Email ' + byEmail + ')\\n' +\n  'Skipped: *' + skipped.length + '*  (' + reasonText + ')';\nreturn [{\n  json: { run_date: runDate, target_date: targetDate, total,\n          sent: sentCount, skipped: skipped.length,\n          by_sms: bySms, by_email: byEmail, summary }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        192
+      ],
+      "id": "8b789885-2f52-40be-8919-f9376c68d3a2",
+      "name": "Summarise Run"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#appointments",
+          "mode": "name"
+        },
+        "text": "={{ $json.summary }}",
+        "otherOptions": {
+          "mrkdwn": true
+        }
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        1120,
+        96
+      ],
+      "id": "f41c4dcc-8f28-45e2-9e77-5c78a0fd917b",
+      "name": "Send a message",
+      "webhookId": "129aed1f-3f86-415e-ba7d-4cfc2612867b",
+      "credentials": {
+        "slackApi": {
+          "id": "jFKuYsH0KfY23SDH",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reminder-agent",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1280,
+        496
+      ],
+      "id": "30cad03f-b320-4bd3-8a5a-87aec3105248",
+      "name": "Webhook Trigger",
+      "webhookId": "f9e8d7c6-1111-4a1b-9c1d-000000000001"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a1b2c3d4-cond-0002",
+              "leftValue": "={{ $json.headers['x-webhook-secret'] }}",
+              "rightValue": "={{ $env.WEBHOOK_SECRET }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -1072,
+        496
+      ],
+      "id": "0331b4ee-fc86-454d-b791-33ff68a35bd6",
+      "name": "Validate Secret"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"success\": false, \"error\": { \"message\": \"Unauthorized\" } } }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -864,
+        608
+      ],
+      "id": "e9faf443-633e-4e9e-80d9-8f7c6b70c12d",
+      "name": "Respond Unauthorized"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a1b2c3d4-cond-0004",
+              "leftValue": "={{ $json.__empty_run }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -656,
+        176
+      ],
+      "id": "9a873cbc-6a88-42c2-be30-22f2cb52d978",
+      "name": "Is Empty Webhook Run?"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ADDITIVE: a website-triggered batch run (\"Run Reminder Agent\") found\n// nothing due tomorrow. Reports a real zero-value summary instead of\n// leaving the request hanging - see the note in \"Build Reminder Queue\".\nreturn [{\n  json: {\n    success: true,\n    data: {\n      run_date: $json.run_date,\n      target_date: $json.target_date,\n      total: 0,\n      sent: 0,\n      skipped: 0,\n      by_sms: 0,\n      by_email: 0\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        496
+      ],
+      "id": "678a1c13-ab79-4d91-8078-99dd99f34ae0",
+      "name": "Build Empty Run Response"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a1b2c3d4-cond-0006",
+              "leftValue": "={{ $json.mode }}",
+              "rightValue": "preview",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -448,
+        176
+      ],
+      "id": "465dcc48-c765-413e-af09-f39dd85c97cd",
+      "name": "Is Preview?"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ADDITIVE: shapes a single reminder's rendered content for the website's\n// \"Send Reminder\" preview dialog. Never sends anything - this branch is\n// reached only when \"Is Preview?\" saw mode === 'preview', which happens\n// BEFORE \"Has Valid Contact?\" / \"Route by Channel\" / the send nodes.\nreturn [{\n  json: {\n    success: true,\n    data: {\n      appointment_id: $json.appointment_id,\n      channel: $json.channel,\n      has_valid_contact: $json.has_valid_contact,\n      skip_reason: $json.skip_reason,\n      sms_text: $json.sms_text,\n      email_subject: $json.email_subject,\n      email_html: $json.email_html\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        496
+      ],
+      "id": "de406d1d-4855-46e8-a7e9-ebad8027c1fe",
+      "name": "Build Preview Response"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_SPREADSHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Activity",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_date": "={{ $json.run_date }}",
+            "target_date": "={{ $json.target_date }}",
+            "mode": "={{ $('Build Reminder Queue').first().json.mode }}",
+            "total": "={{ $json.total }}",
+            "sent": "={{ $json.sent }}",
+            "skipped": "={{ $json.skipped }}",
+            "by_sms": "={{ $json.by_sms }}",
+            "by_email": "={{ $json.by_email }}",
+            "status": "success"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "run_date",
+              "displayName": "run_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "target_date",
+              "displayName": "target_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "mode",
+              "displayName": "mode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "total",
+              "displayName": "total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sent",
+              "displayName": "sent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "skipped",
+              "displayName": "skipped",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "by_sms",
+              "displayName": "by_sms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "by_email",
+              "displayName": "by_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1120,
+        384
+      ],
+      "id": "512c5177-5627-40ac-869c-3cfbd1f1bab3",
+      "name": "Log Run Summary",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "lFe66XzWiOEJtkGu",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ADDITIVE: wraps Summarise Run's output in the website's standard\n// {success, data} envelope for the \"Run Reminder Agent\" / \"Send Reminder\"\n// API responses. Summarise Run's own output (and its existing Slack wire)\n// is untouched - this is a read-only parallel branch.\nreturn [{\n  json: {\n    success: true,\n    data: {\n      run_date: $json.run_date,\n      target_date: $json.target_date,\n      total: $json.total,\n      sent: $json.sent,\n      skipped: $json.skipped,\n      by_sms: $json.by_sms,\n      by_email: $json.by_email\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        992,
+        608
+      ],
+      "id": "f1aa189f-8dd0-4a34-841f-483b20c1ec7c",
+      "name": "Build Webhook Response"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1344,
+        496
+      ],
+      "id": "a0c382c5-fa88-4170-ad98-3b32fe4c6f5a",
+      "name": "Respond Success"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet": {
+      "main": [
+        [
+          {
+            "node": "Build Reminder Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reminder Queue": {
+      "main": [
+        [
+          {
+            "node": "Is Empty Webhook Run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Valid Contact?": {
+      "main": [
+        [
+          {
+            "node": "Route by Channel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Skipped Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Channel": {
+      "main": [
+        [
+          {
+            "node": "Send SMS Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Email Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send SMS Reminder": {
+      "main": [
+        [
+          {
+            "node": "Mark Reminder Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email Reminder": {
+      "main": [
+        [
+          {
+            "node": "Mark Reminder Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Reminder Sent": {
+      "main": [
+        [
+          {
+            "node": "Summarise Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Skipped Records": {
+      "main": [
+        [
+          {
+            "node": "Summarise Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise Run": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Run Summary",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate Secret",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Secret": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Empty Webhook Run?": {
+      "main": [
+        [
+          {
+            "node": "Build Empty Run Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Preview?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Empty Run Response": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Preview?": {
+      "main": [
+        [
+          {
+            "node": "Build Preview Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Has Valid Contact?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Preview Response": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Webhook Response": {
+      "main": [
+        [
+          {
+            "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "b649a1b5-e9f3-49c1-8b10-66b76b1901e5",
+  "meta": {},
+  "nodeGroups": [],
+  "id": "2LeurkDZPzRnKKDB",
+  "tags": []
+}
