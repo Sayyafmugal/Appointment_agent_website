@@ -5,6 +5,19 @@ import { ApiError } from "@/lib/api/response"
 let sheetsClient: sheets_v4.Sheets | null = null
 const sheetIdCache = new Map<string, number>()
 
+/**
+ * True when Google Sheets credentials aren't configured (e.g. the public
+ * demo deployment). Callers fall back to the static sample dataset in
+ * @/lib/demo/data instead of throwing.
+ */
+export function isDemoMode(): boolean {
+  return (
+    !process.env.GOOGLE_SHEETS_ID ||
+    !process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ||
+    !process.env.GOOGLE_PRIVATE_KEY
+  )
+}
+
 function requireEnv(name: string): string {
   const value = process.env[name]
   if (!value) {

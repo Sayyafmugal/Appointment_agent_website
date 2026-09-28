@@ -1,10 +1,13 @@
 import "server-only"
-import { getSheetsClient, getSpreadsheetId } from "./client"
+import { getSheetsClient, getSpreadsheetId, isDemoMode } from "./client"
 import { readSheetGrid } from "./row-mapper"
+import { buildDemoExceptions } from "@/lib/demo/data"
 import { SHEET_NAMES } from "@/lib/constants"
 import type { ExceptionRecord } from "@/types/exception"
 
 export async function listExceptions(): Promise<ExceptionRecord[]> {
+  if (isDemoMode()) return buildDemoExceptions()
+
   const sheets = getSheetsClient()
   const spreadsheetId = getSpreadsheetId()
   const { header, values } = await readSheetGrid(

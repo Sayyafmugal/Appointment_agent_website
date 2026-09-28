@@ -1,5 +1,5 @@
 import "server-only"
-import { getSheetsClient, getSpreadsheetId, resolveSheetId } from "./client"
+import { getSheetsClient, getSpreadsheetId, isDemoMode, resolveSheetId } from "./client"
 import {
   APPOINTMENTS_HEADER,
   appointmentToRowArray,
@@ -8,6 +8,7 @@ import {
   readSheetGrid,
   rowArrayToAppointment,
 } from "./row-mapper"
+import { buildDemoAppointments } from "@/lib/demo/data"
 import { SHEET_NAMES } from "@/lib/constants"
 import type {
   Appointment,
@@ -24,11 +25,21 @@ const SHEET = SHEET_NAMES.appointments
 let cache: { at: number; items: Appointment[] } | null = null
 const CACHE_TTL_MS = 5_000
 
+// In demo mode there's no real backend to write to, so mutations act on an
+// in-memory copy of the sample dataset instead (reset on cold start).
+let demoStore: Appointment[] | null = null
+function getDemoStore(): Appointment[] {
+  if (!demoStore) demoStore = buildDemoAppointments()
+  return demoStore
+}
+
 export function invalidateAppointmentsCache(): void {
   cache = null
 }
 
 export async function listAppointments(): Promise<Appointment[]> {
+  if (isDemoMode()) return [...getDemoStore()]
+
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) {
     return cache.items
   }
@@ -63,14 +74,26 @@ function generateAppointmentId(): string {
 export async function createAppointment(
   input: AppointmentCreateInput
 ): Promise<Appointment> {
-  const sheets = getSheetsClient()
-  const spreadsheetId = getSpreadsheetId()
-
   const appointment_id = input.appointment_id || generateAppointmentId()
   const existing = await getAppointmentById(appointment_id)
   if (existing) {
     throw new Error(`An appointment with ID "${appointment_id}" already exists.`)
   }
+
+  if (isDemoMode()) {
+    const created: Appointment = {
+      ...input,
+      appointment_id,
+      reminder_sent: false,
+      reminder_channel: "",
+      reminder_sent_at: "",
+    }
+    getDemoStore().push(created)
+    return created
+  }
+
+  const sheets = getSheetsClient()
+  const spreadsheetId = getSpreadsheetId()
 
   const rowArray = appointmentToRowArray([...APPOINTMENTS_HEADER], {
     ...input,
@@ -100,6 +123,16 @@ export async function updateAppointment(
   appointmentId: string,
   patch: AppointmentUpdateInput
 ): Promise<Appointment> {
+  if (isDemoMode()) {
+    const store = getDemoStore()
+    const idx = store.findIndex((a) => a.appointment_id === appointmentId)
+    if (idx === -1) {
+      throw new Error(`Appointment "${appointmentId}" was not found.`)
+    }
+    store[idx] = { ...store[idx], ...patch }
+    return store[idx]
+  }
+
   const sheets = getSheetsClient()
   const spreadsheetId = getSpreadsheetId()
 
@@ -127,6 +160,16 @@ export async function updateAppointment(
 }
 
 export async function deleteAppointment(appointmentId: string): Promise<void> {
+  if (isDemoMode()) {
+    const store = getDemoStore()
+    const idx = store.findIndex((a) => a.appointment_id === appointmentId)
+    if (idx === -1) {
+      throw new Error(`Appointment "${appointmentId}" was not found.`)
+    }
+    store.splice(idx, 1)
+    return
+  }
+
   const sheets = getSheetsClient()
   const spreadsheetId = getSpreadsheetId()
 

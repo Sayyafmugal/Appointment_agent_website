@@ -2,9 +2,10 @@ import { WifiOffIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 
 /**
- * Shown whenever an API call fails (n8n unreachable, Google Sheets not
- * configured/shared, etc). Never renders placeholder/fake data in its place —
- * per spec, a broken backend must say so, not pretend to work.
+ * Shown whenever an API call genuinely fails (n8n unreachable, Sheets shared
+ * incorrectly, etc). Missing Google Sheets credentials is NOT one of these
+ * cases — that falls back to the sample dataset in @/lib/demo/data instead
+ * of erroring, so the public demo deployment always has something to show.
  */
 export function ErrorState({
   title = "Backend unavailable",

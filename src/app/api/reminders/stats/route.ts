@@ -1,5 +1,6 @@
 import { listAppointments } from "@/lib/google-sheets/appointments"
 import { listExceptions } from "@/lib/google-sheets/exceptions"
+import { isDemoMode } from "@/lib/google-sheets/client"
 import { buildReminderQueuePreview } from "@/lib/reminders/queue"
 import { readSettings } from "@/lib/settings/store"
 import { todayIso, tomorrowIso } from "@/lib/format"
@@ -42,6 +43,7 @@ export const GET = withErrorHandling(async () => {
       appointments,
       settings.default_lead_days
     ),
+    demo_mode: isDemoMode(),
   }
 
   return ok(stats)

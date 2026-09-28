@@ -32,6 +32,11 @@ export function StatusTicker() {
   const clinicName = settings.data?.clinic_display_name
 
   const items = [
+    stats.data?.demo_mode ? (
+      <span key="demo" className="font-semibold" style={{ color: "var(--ticker-accent)" }}>
+        🧪 Live Demo — sample data (connect Google Sheets for a real backend)
+      </span>
+    ) : null,
     <span key="status" className="flex items-center gap-1.5">
       <PulseDot tone={connectionTone} /> n8n Webhook Status: {connectionLabel}
     </span>,

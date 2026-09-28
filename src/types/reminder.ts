@@ -61,4 +61,5 @@ export interface ReminderStats {
   by_email: number
   status_breakdown: { status: string; count: number }[]
   tomorrow_queue_preview: ReminderQueueItem[]
+  demo_mode: boolean
 }

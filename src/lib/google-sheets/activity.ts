@@ -1,6 +1,7 @@
 import "server-only"
-import { getSheetsClient, getSpreadsheetId } from "./client"
+import { getSheetsClient, getSpreadsheetId, isDemoMode } from "./client"
 import { readSheetGrid } from "./row-mapper"
+import { buildDemoActivity } from "@/lib/demo/data"
 import { SHEET_NAMES } from "@/lib/constants"
 import type { ActivityRun, RunMode } from "@/types/activity"
 
@@ -17,6 +18,8 @@ function toNumber(value: string | undefined): number {
  * website, so Activity always reflects what the automation actually did.
  */
 export async function listActivity(): Promise<ActivityRun[]> {
+  if (isDemoMode()) return buildDemoActivity()
+
   const sheets = getSheetsClient()
   const spreadsheetId = getSpreadsheetId()
   const { header, values } = await readSheetGrid(
